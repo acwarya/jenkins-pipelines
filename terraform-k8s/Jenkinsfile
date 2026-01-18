@@ -1,0 +1,293 @@
+﻿pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'ACTION',
+            choices: ['plan', 'apply', 'destroy'],
+            description: 'Select Terraform action'
+        )
+        string(
+            name: 'CLUSTER_NAME',
+            defaultValue: 'jenkins-k8s-cluster',
+            description: 'Kubernetes cluster name'
+        )
+        choice(
+            name: 'AWS_REGION',
+            choices: ['us-east-1', 'us-west-2', 'eu-west-1', 'ap-south-1'],
+            description: 'AWS Region'
+        )
+        string(
+            name: 'TERRAFORM_REPO',
+            defaultValue: 'https://github.com/acwarya/terraform-k8s-aws.git',
+            description: 'Terraform repository URL'
+        )
+        string(
+            name: 'TERRAFORM_BRANCH',
+            defaultValue: 'main',
+            description: 'Git branch to use'
+        )
+    }
+    
+    environment {
+        AWS_DEFAULT_REGION = "${params.AWS_REGION}"
+        TF_VAR_cluster_name = "${params.CLUSTER_NAME}"
+        TF_VAR_aws_region = "${params.AWS_REGION}"
+        TERRAFORM_DIR = 'terraform-code'
+    }
+    
+    stages {
+        stage('Cleanup Workspace') {
+            steps {
+                echo ' Cleaning workspace...'
+                cleanWs()
+            }
+        }
+        
+        stage('Clone Terraform Repository') {
+            steps {
+                echo ' Cloning Terraform code from GitHub...'
+                echo "Repository: ${params.TERRAFORM_REPO}"
+                echo "Branch: ${params.TERRAFORM_BRANCH}"
+                
+                dir("${env.TERRAFORM_DIR}") {
+                    git branch: "${params.TERRAFORM_BRANCH}",
+                        url: "${params.TERRAFORM_REPO}"
+                }
+                
+                echo ' Repository cloned successfully'
+                sh "ls -la ${env.TERRAFORM_DIR}"
+            }
+        }
+        
+        stage('Terraform Init') {
+            steps {
+                dir("${env.TERRAFORM_DIR}") {
+                    echo ' Initializing Terraform...'
+                    sh '''
+                        terraform init -no-color
+                        echo ""
+                        echo "Terraform initialized successfully"
+                    '''
+                }
+            }
+        }
+        
+        stage('Terraform Validate') {
+            when {
+                expression { params.ACTION != 'destroy' }
+            }
+            steps {
+                dir("${env.TERRAFORM_DIR}") {
+                    echo ' Validating Terraform configuration...'
+                    sh 'terraform validate -no-color'
+                }
+            }
+        }
+        
+        stage('Terraform Plan') {
+            when {
+                expression { params.ACTION == 'plan' || params.ACTION == 'apply' }
+            }
+            steps {
+                dir("${env.TERRAFORM_DIR}") {
+                    echo ' Creating Terraform plan...'
+                    sh '''
+                        terraform plan -no-color -out=tfplan
+                        echo ""
+                        echo ""
+                        echo "         TERRAFORM PLAN SUMMARY         "
+                        echo ""
+                        echo ""
+                        echo "Review the plan above carefully"
+                        echo "Cluster Name: ${TF_VAR_cluster_name}"
+                        echo "AWS Region: ${AWS_DEFAULT_REGION}"
+                        echo ""
+                    '''
+                }
+            }
+        }
+        
+        stage('Approval for Apply') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                script {
+                    echo ''
+                    echo ''
+                    echo '     WAITING FOR MANUAL APPROVAL        '
+                    echo ''
+                    echo ''
+                    echo 'Resources to be created:'
+                    echo '   VPC and Networking'
+                    echo '   1 Master Node (t3.micro)'
+                    echo '   2 Worker Nodes (t3.micro)'
+                    echo '   Security Groups'
+                    echo '   SSH Key Pair'
+                    echo ''
+                    echo "Cluster: ${params.CLUSTER_NAME}"
+                    echo "Region: ${params.AWS_REGION}"
+                    echo ''
+                    
+                    input message: 'Deploy infrastructure to AWS?', 
+                          ok: 'Yes, Deploy Now',
+                          submitter: 'admin'
+                }
+            }
+        }
+        
+        stage('Terraform Apply') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                dir("${env.TERRAFORM_DIR}") {
+                    echo ' Deploying infrastructure...'
+                    sh '''
+                        terraform apply -no-color -auto-approve tfplan
+                        echo ""
+                        echo ""
+                        echo "    INFRASTRUCTURE DEPLOYED!            "
+                        echo ""
+                    '''
+                }
+            }
+        }
+        
+        stage('Approval for Destroy') {
+            when {
+                expression { params.ACTION == 'destroy' }
+            }
+            steps {
+                script {
+                    echo ''
+                    echo ''
+                    echo '    DESTRUCTIVE OPERATION WARNING!   '
+                    echo ''
+                    echo ''
+                    echo 'This will PERMANENTLY DELETE:'
+                    echo '   All EC2 instances'
+                    echo '   VPC and networking'
+                    echo '   Security groups'
+                    echo '   SSH keys'
+                    echo '   Everything in the Kubernetes cluster'
+                    echo ''
+                    echo "Cluster: ${params.CLUSTER_NAME}"
+                    echo "Region: ${params.AWS_REGION}"
+                    echo ''
+                    
+                    input message: 'Are you ABSOLUTELY SURE?', 
+                          ok: 'Yes, Destroy Everything',
+                          submitter: 'admin'
+                }
+            }
+        }
+        
+        stage('Terraform Destroy') {
+            when {
+                expression { params.ACTION == 'destroy' }
+            }
+            steps {
+                dir("${env.TERRAFORM_DIR}") {
+                    echo ' Destroying infrastructure...'
+                    sh '''
+                        terraform destroy -no-color -auto-approve
+                        echo ""
+                        echo ""
+                        echo "   ALL RESOURCES DESTROYED              "
+                        echo ""
+                    '''
+                }
+            }
+        }
+        
+        stage('Display Outputs') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                dir("${env.TERRAFORM_DIR}") {
+                    echo ' Retrieving deployment information...'
+                    sh '''
+                        echo ""
+                        echo ""
+                        echo "     KUBERNETES CLUSTER ACCESS          "
+                        echo ""
+                        echo ""
+                        terraform output -no-color
+                        echo ""
+                        
+                        # Save outputs to file
+                        terraform output -no-color > deployment-info.txt
+                        
+                        echo "SSH Key Location:"
+                        echo "  Workspace: $(pwd)"
+                        ls -lh *.pem 2>/dev/null || echo "  Key: ${TF_VAR_cluster_name}.pem"
+                        echo ""
+                        
+                        # Show connection command
+                        MASTER_IP=$(terraform output -raw master_public_ip 2>/dev/null || echo "Check outputs above")
+                        echo "Quick Connect:"
+                        echo "  ssh -i ${TF_VAR_cluster_name}.pem ubuntu@${MASTER_IP}"
+                        echo ""
+                    '''
+                    
+                    archiveArtifacts artifacts: 'deployment-info.txt', 
+                                    fingerprint: true,
+                                    allowEmptyArchive: true
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                echo ''
+                echo ''
+                if (params.ACTION == 'apply') {
+                    echo '   DEPLOYMENT SUCCESSFUL!             '
+                    echo ''
+                    echo ''
+                    echo 'Next Steps:'
+                    echo '  1. Download deployment-info.txt from artifacts'
+                    echo '  2. Get SSH key from Jenkins workspace'
+                    echo '  3. Connect to master node'
+                    echo '  4. Run: kubectl get nodes'
+                    echo ''
+                    echo 'Workspace Path:'
+                    echo "  ${env.WORKSPACE}/${env.TERRAFORM_DIR}"
+                } else if (params.ACTION == 'destroy') {
+                    echo '   DESTRUCTION COMPLETE!              '
+                    echo ''
+                    echo ''
+                    echo 'All AWS resources have been removed.'
+                } else {
+                    echo '   PLAN COMPLETE!                     '
+                    echo ''
+                    echo ''
+                    echo 'Review the plan output above.'
+                    echo 'Run with ACTION=apply to deploy.'
+                }
+                echo ''
+            }
+        }
+        failure {
+            echo ''
+            echo ''
+            echo '   PIPELINE FAILED!                   '
+            echo ''
+            echo ''
+            echo 'Check the console output above for errors.'
+        }
+        always {
+            echo ' Cleaning up temporary files...'
+            dir("${env.TERRAFORM_DIR}") {
+                sh '''
+                    rm -f tfplan 2>/dev/null || true
+                '''
+            }
+        }
+    }
+}
