@@ -14,7 +14,7 @@ pipeline {
         )
         choice(
             name: 'AWS_REGION',
-            choices: ['us-east-1', 'us-west-2', 'eu-west-1', 'ap-south-1'],
+            choices: ['us-east-1', 'us-west-2', 'eu-west-1'],
             description: 'AWS Region'
         )
         string(
@@ -40,7 +40,7 @@ pipeline {
         stage('Cleanup Workspace') {
             steps {
                 echo 'Cleaning workspace...'
-                cleanWs()
+                deleteDir()
             }
         }
         
@@ -91,9 +91,11 @@ pipeline {
                     sh '''
                         terraform plan -no-color -out=tfplan
                         echo ""
-                        echo "Plan created successfully"
-                        echo "Cluster Name: ${TF_VAR_cluster_name}"
-                        echo "AWS Region: ${AWS_DEFAULT_REGION}"
+                        echo "=================================="
+                        echo "Plan Summary:"
+                        echo "Cluster: ${TF_VAR_cluster_name}"
+                        echo "Region: ${AWS_DEFAULT_REGION}"
+                        echo "=================================="
                     '''
                 }
             }
@@ -119,6 +121,7 @@ pipeline {
                 dir("${env.TERRAFORM_DIR}") {
                     echo 'Deploying infrastructure...'
                     sh 'terraform apply -no-color -auto-approve tfplan'
+                    echo 'Deployment complete!'
                 }
             }
         }
@@ -129,8 +132,8 @@ pipeline {
             }
             steps {
                 script {
-                    input message: 'Are you ABSOLUTELY SURE you want to destroy everything?', 
-                          ok: 'Yes, Destroy All Resources'
+                    input message: 'DESTROY all resources?', 
+                          ok: 'Yes, Destroy Everything'
                 }
             }
         }
@@ -143,6 +146,7 @@ pipeline {
                 dir("${env.TERRAFORM_DIR}") {
                     echo 'Destroying infrastructure...'
                     sh 'terraform destroy -no-color -auto-approve'
+                    echo 'All resources destroyed!'
                 }
             }
         }
@@ -155,11 +159,15 @@ pipeline {
                 dir("${env.TERRAFORM_DIR}") {
                     echo 'Deployment Information:'
                     sh '''
-                        terraform output -no-color
-                        terraform output -no-color > deployment-info.txt
                         echo ""
-                        echo "SSH Key: $(pwd)/*.pem"
-                        ls -lh *.pem 2>/dev/null || true
+                        echo "=================================="
+                        echo "CLUSTER ACCESS INFORMATION"
+                        echo "=================================="
+                        terraform output -no-color
+                        echo ""
+                        terraform output -no-color > deployment-info.txt
+                        echo "SSH Key Location:"
+                        ls -lh *.pem 2>/dev/null || echo "Key: ${TF_VAR_cluster_name}.pem"
                     '''
                     archiveArtifacts artifacts: 'deployment-info.txt', 
                                     fingerprint: true,
@@ -174,7 +182,7 @@ pipeline {
             echo 'Pipeline completed successfully!'
         }
         failure {
-            echo 'Pipeline failed! Check the logs above.'
+            echo 'Pipeline failed! Check logs above.'
         }
         always {
             dir("${env.TERRAFORM_DIR}") {
