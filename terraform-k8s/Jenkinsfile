@@ -11,11 +11,6 @@ spec:
     command:
     - cat
     tty: true
-  - name: aws-cli
-    image: amazon/aws-cli:latest
-    command:
-    - cat
-    tty: true
 '''
         }
     }
@@ -196,14 +191,14 @@ spec:
             }
         }
         
-        stage('Display Outputs') {
+        stage('Display Outputs and Save Keys') {
             when {
                 expression { params.ACTION == 'apply' }
             }
             steps {
                 container('terraform') {
                     dir("${env.TERRAFORM_DIR}") {
-                        echo 'Deployment Information:'
+                        echo 'Retrieving deployment information...'
                         sh '''
                             echo ""
                             echo "=================================="
@@ -211,11 +206,39 @@ spec:
                             echo "=================================="
                             terraform output -no-color
                             echo ""
+                            
+                            # Save outputs
                             terraform output -no-color > deployment-info.txt
-                            echo "SSH Key Location:"
-                            ls -lh *.pem 2>/dev/null || echo "Key: ${TF_VAR_cluster_name}.pem"
+                            
+                            # Find and display SSH key info
+                            echo ""
+                            echo "SSH Key Files:"
+                            ls -lh *.pem 2>/dev/null || echo "No .pem files found"
+                            
+                            # Get master IP
+                            MASTER_IP=$(terraform output -raw master_public_ip 2>/dev/null || echo "unknown")
+                            SSH_KEY=$(ls *.pem 2>/dev/null | head -n1)
+                            
+                            echo ""
+                            echo "=================================="
+                            echo "QUICK ACCESS COMMAND:"
+                            echo "=================================="
+                            if [ -f "$SSH_KEY" ]; then
+                                echo "ssh -i $SSH_KEY ubuntu@$MASTER_IP"
+                                echo ""
+                                echo "Download the SSH key from Jenkins artifacts:"
+                                echo "Build #${BUILD_NUMBER} -> Artifacts -> $SSH_KEY"
+                            fi
+                            echo ""
                         '''
+                        
+                        // Archive deployment info
                         archiveArtifacts artifacts: 'deployment-info.txt', 
+                                        fingerprint: true,
+                                        allowEmptyArchive: true
+                        
+                        // Archive SSH key (IMPORTANT!)
+                        archiveArtifacts artifacts: '*.pem', 
                                         fingerprint: true,
                                         allowEmptyArchive: true
                     }
@@ -226,7 +249,21 @@ spec:
     
     post {
         success {
-            echo 'Pipeline completed successfully!'
+            script {
+                echo ''
+                echo '=================================='
+                echo 'Pipeline completed successfully!'
+                echo '=================================='
+                if (params.ACTION == 'apply') {
+                    echo ''
+                    echo 'Next Steps:'
+                    echo '1. Go to Build Artifacts (below)'
+                    echo '2. Download the .pem SSH key file'
+                    echo '3. Download deployment-info.txt for IPs'
+                    echo '4. Connect: ssh -i <key>.pem ubuntu@<master-ip>'
+                    echo ''
+                }
+            }
         }
         failure {
             echo 'Pipeline failed! Check logs above.'
