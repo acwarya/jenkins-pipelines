@@ -1,5 +1,24 @@
 pipeline {
-    agent any
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: terraform
+    image: hashicorp/terraform:1.6
+    command:
+    - cat
+    tty: true
+  - name: aws-cli
+    image: amazon/aws-cli:latest
+    command:
+    - cat
+    tty: true
+'''
+        }
+    }
     
     parameters {
         choice(
@@ -62,9 +81,12 @@ pipeline {
         
         stage('Terraform Init') {
             steps {
-                dir("${env.TERRAFORM_DIR}") {
-                    echo 'Initializing Terraform...'
-                    sh 'terraform init -no-color'
+                container('terraform') {
+                    dir("${env.TERRAFORM_DIR}") {
+                        echo 'Initializing Terraform...'
+                        sh 'terraform version'
+                        sh 'terraform init -no-color'
+                    }
                 }
             }
         }
@@ -74,9 +96,11 @@ pipeline {
                 expression { params.ACTION != 'destroy' }
             }
             steps {
-                dir("${env.TERRAFORM_DIR}") {
-                    echo 'Validating Terraform configuration...'
-                    sh 'terraform validate -no-color'
+                container('terraform') {
+                    dir("${env.TERRAFORM_DIR}") {
+                        echo 'Validating Terraform configuration...'
+                        sh 'terraform validate -no-color'
+                    }
                 }
             }
         }
@@ -86,17 +110,24 @@ pipeline {
                 expression { params.ACTION == 'plan' || params.ACTION == 'apply' }
             }
             steps {
-                dir("${env.TERRAFORM_DIR}") {
-                    echo 'Creating Terraform plan...'
-                    sh '''
-                        terraform plan -no-color -out=tfplan
-                        echo ""
-                        echo "=================================="
-                        echo "Plan Summary:"
-                        echo "Cluster: ${TF_VAR_cluster_name}"
-                        echo "Region: ${AWS_DEFAULT_REGION}"
-                        echo "=================================="
-                    '''
+                container('terraform') {
+                    dir("${env.TERRAFORM_DIR}") {
+                        echo 'Creating Terraform plan...'
+                        withCredentials([
+                            string(credentialsId: 'aws-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
+                            string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
+                        ]) {
+                            sh '''
+                                terraform plan -no-color -out=tfplan
+                                echo ""
+                                echo "=================================="
+                                echo "Plan Summary:"
+                                echo "Cluster: ${TF_VAR_cluster_name}"
+                                echo "Region: ${AWS_DEFAULT_REGION}"
+                                echo "=================================="
+                            '''
+                        }
+                    }
                 }
             }
         }
@@ -118,10 +149,17 @@ pipeline {
                 expression { params.ACTION == 'apply' }
             }
             steps {
-                dir("${env.TERRAFORM_DIR}") {
-                    echo 'Deploying infrastructure...'
-                    sh 'terraform apply -no-color -auto-approve tfplan'
-                    echo 'Deployment complete!'
+                container('terraform') {
+                    dir("${env.TERRAFORM_DIR}") {
+                        echo 'Deploying infrastructure...'
+                        withCredentials([
+                            string(credentialsId: 'aws-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
+                            string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
+                        ]) {
+                            sh 'terraform apply -no-color -auto-approve tfplan'
+                        }
+                        echo 'Deployment complete!'
+                    }
                 }
             }
         }
@@ -143,10 +181,17 @@ pipeline {
                 expression { params.ACTION == 'destroy' }
             }
             steps {
-                dir("${env.TERRAFORM_DIR}") {
-                    echo 'Destroying infrastructure...'
-                    sh 'terraform destroy -no-color -auto-approve'
-                    echo 'All resources destroyed!'
+                container('terraform') {
+                    dir("${env.TERRAFORM_DIR}") {
+                        echo 'Destroying infrastructure...'
+                        withCredentials([
+                            string(credentialsId: 'aws-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
+                            string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
+                        ]) {
+                            sh 'terraform destroy -no-color -auto-approve'
+                        }
+                        echo 'All resources destroyed!'
+                    }
                 }
             }
         }
@@ -156,22 +201,24 @@ pipeline {
                 expression { params.ACTION == 'apply' }
             }
             steps {
-                dir("${env.TERRAFORM_DIR}") {
-                    echo 'Deployment Information:'
-                    sh '''
-                        echo ""
-                        echo "=================================="
-                        echo "CLUSTER ACCESS INFORMATION"
-                        echo "=================================="
-                        terraform output -no-color
-                        echo ""
-                        terraform output -no-color > deployment-info.txt
-                        echo "SSH Key Location:"
-                        ls -lh *.pem 2>/dev/null || echo "Key: ${TF_VAR_cluster_name}.pem"
-                    '''
-                    archiveArtifacts artifacts: 'deployment-info.txt', 
-                                    fingerprint: true,
-                                    allowEmptyArchive: true
+                container('terraform') {
+                    dir("${env.TERRAFORM_DIR}") {
+                        echo 'Deployment Information:'
+                        sh '''
+                            echo ""
+                            echo "=================================="
+                            echo "CLUSTER ACCESS INFORMATION"
+                            echo "=================================="
+                            terraform output -no-color
+                            echo ""
+                            terraform output -no-color > deployment-info.txt
+                            echo "SSH Key Location:"
+                            ls -lh *.pem 2>/dev/null || echo "Key: ${TF_VAR_cluster_name}.pem"
+                        '''
+                        archiveArtifacts artifacts: 'deployment-info.txt', 
+                                        fingerprint: true,
+                                        allowEmptyArchive: true
+                    }
                 }
             }
         }
@@ -185,8 +232,10 @@ pipeline {
             echo 'Pipeline failed! Check logs above.'
         }
         always {
-            dir("${env.TERRAFORM_DIR}") {
-                sh 'rm -f tfplan 2>/dev/null || true'
+            container('terraform') {
+                dir("${env.TERRAFORM_DIR}") {
+                    sh 'rm -f tfplan 2>/dev/null || true'
+                }
             }
         }
     }
