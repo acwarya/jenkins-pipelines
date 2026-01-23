@@ -4,6 +4,9 @@ pipeline {
             yaml '''
 apiVersion: v1
 kind: Pod
+metadata:
+  labels:
+    jenkins: agent
 spec:
   containers:
   - name: terraform
@@ -11,45 +14,58 @@ spec:
     command:
     - cat
     tty: true
+    env:
+    - name: AWS_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: aws-credentials
+          key: AWS_ACCESS_KEY_ID
+    - name: AWS_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: aws-credentials
+          key: AWS_SECRET_ACCESS_KEY
+    - name: AWS_DEFAULT_REGION
+      valueFrom:
+        secretKeyRef:
+          name: aws-credentials
+          key: AWS_DEFAULT_REGION
+    - name: TF_BACKEND_BUCKET
+      valueFrom:
+        configMapKeyRef:
+          name: terraform-backend-config
+          key: TF_BACKEND_BUCKET
+    - name: TF_BACKEND_KEY
+      valueFrom:
+        configMapKeyRef:
+          name: terraform-backend-config
+          key: TF_BACKEND_KEY
+    - name: TF_BACKEND_REGION
+      valueFrom:
+        configMapKeyRef:
+          name: terraform-backend-config
+          key: TF_BACKEND_REGION
+    - name: TF_BACKEND_DYNAMODB_TABLE
+      valueFrom:
+        configMapKeyRef:
+          name: terraform-backend-config
+          key: TF_BACKEND_DYNAMODB_TABLE
+    volumeMounts:
+    - name: terraform-backend-config
+      mountPath: /etc/terraform
+  volumes:
+  - name: terraform-backend-config
+    configMap:
+      name: terraform-backend-config
 '''
         }
     }
-    
-    parameters {
-        choice(
-            name: 'ACTION',
-            choices: ['plan', 'apply', 'destroy'],
-            description: 'Select Terraform action'
-        )
-        string(
-            name: 'CLUSTER_NAME',
-            defaultValue: 'jenkins-k8s-cluster',
-            description: 'Kubernetes cluster name'
-        )
-        choice(
-            name: 'AWS_REGION',
-            choices: ['us-east-1', 'us-west-2', 'eu-west-1'],
-            description: 'AWS Region'
-        )
-        string(
-            name: 'TERRAFORM_REPO',
-            defaultValue: 'https://github.com/acwarya/terraform-k8s-aws.git',
-            description: 'Terraform repository URL'
-        )
-        string(
-            name: 'TERRAFORM_BRANCH',
-            defaultValue: 'main',
-            description: 'Git branch to use'
-        )
-    }
-    
+
     environment {
-        AWS_DEFAULT_REGION = "${params.AWS_REGION}"
-        TF_VAR_cluster_name = "${params.CLUSTER_NAME}"
-        TF_VAR_aws_region = "${params.AWS_REGION}"
-        TERRAFORM_DIR = 'terraform-code'
+        TERRAFORM_REPO = 'https://github.com/acwarya/terraform-k8s-aws.git'
+        TERRAFORM_BRANCH = 'main'
     }
-    
+
     stages {
         stage('Cleanup Workspace') {
             steps {
@@ -57,223 +73,199 @@ spec:
                 deleteDir()
             }
         }
-        
+
         stage('Clone Terraform Repository') {
             steps {
                 echo 'Cloning Terraform code from GitHub...'
-                echo "Repository: ${params.TERRAFORM_REPO}"
-                echo "Branch: ${params.TERRAFORM_BRANCH}"
+                echo "Repository: ${TERRAFORM_REPO}"
+                echo "Branch: ${TERRAFORM_BRANCH}"
                 
-                dir("${env.TERRAFORM_DIR}") {
-                    git branch: "${params.TERRAFORM_BRANCH}",
-                        url: "${params.TERRAFORM_REPO}"
+                dir('terraform-code') {
+                    git url: "${TERRAFORM_REPO}", branch: "${TERRAFORM_BRANCH}"
                 }
                 
                 echo 'Repository cloned successfully'
-                sh "ls -la ${env.TERRAFORM_DIR}"
+                sh 'ls -la terraform-code'
             }
         }
-        
+
         stage('Terraform Init') {
             steps {
                 container('terraform') {
-                    dir("${env.TERRAFORM_DIR}") {
+                    dir('terraform-code') {
                         echo 'Initializing Terraform...'
                         sh 'terraform version'
-                        sh 'terraform init -no-color'
+                        
+                        // Option 1: Using backend config file from mounted volume
+                        sh '''
+                            echo "Backend configuration from file:"
+                            cat /etc/terraform/backend-config.hcl || echo "Config file not found, using env vars"
+                            
+                            # Initialize with backend config
+                            if [ -f /etc/terraform/backend-config.hcl ]; then
+                                terraform init -no-color -backend-config=/etc/terraform/backend-config.hcl
+                            else
+                                # Fallback to environment variables
+                                terraform init -no-color \
+                                    -backend-config="bucket=${TF_BACKEND_BUCKET}" \
+                                    -backend-config="key=${TF_BACKEND_KEY}" \
+                                    -backend-config="region=${TF_BACKEND_REGION}" \
+                                    -backend-config="dynamodb_table=${TF_BACKEND_DYNAMODB_TABLE}" \
+                                    -backend-config="encrypt=true"
+                            fi
+                        '''
                     }
                 }
             }
         }
-        
+
         stage('Terraform Validate') {
-            when {
-                expression { params.ACTION != 'destroy' }
-            }
             steps {
                 container('terraform') {
-                    dir("${env.TERRAFORM_DIR}") {
+                    dir('terraform-code') {
                         echo 'Validating Terraform configuration...'
                         sh 'terraform validate -no-color'
                     }
                 }
             }
         }
-        
+
         stage('Terraform Plan') {
+            steps {
+                container('terraform') {
+                    dir('terraform-code') {
+                        echo 'Creating Terraform execution plan...'
+                        sh 'terraform plan -no-color -out=tfplan'
+                        
+                        echo 'Terraform plan created successfully'
+                        echo 'Plan saved to: tfplan'
+                    }
+                }
+            }
+        }
+
+        stage('Approval for Apply') {
+            steps {
+                script {
+                    echo 'Waiting for approval to apply changes...'
+                    input message: 'Do you want to apply the Terraform plan?', 
+                          ok: 'Apply',
+                          submitter: 'admin'
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            steps {
+                container('terraform') {
+                    dir('terraform-code') {
+                        echo 'Applying Terraform changes...'
+                        sh 'terraform apply -no-color -auto-approve tfplan'
+                        echo 'Terraform apply completed successfully!'
+                    }
+                }
+            }
+        }
+
+        stage('Approval for Destroy') {
+            steps {
+                script {
+                    echo 'Do you want to destroy the infrastructure?'
+                    input message: 'WARNING: This will destroy all resources. Continue?',
+                          ok: 'Destroy',
+                          submitter: 'admin'
+                }
+            }
+        }
+
+        stage('Terraform Destroy') {
+            steps {
+                container('terraform') {
+                    dir('terraform-code') {
+                        echo 'Destroying Terraform infrastructure...'
+                        sh 'terraform destroy -no-color -auto-approve'
+                        echo 'Infrastructure destroyed successfully!'
+                    }
+                }
+            }
+        }
+
+        stage('Display Outputs and Save Keys') {
             when {
-                expression { params.ACTION == 'plan' || params.ACTION == 'apply' }
+                expression { 
+                    return currentBuild.result != 'FAILURE' && 
+                           currentBuild.getPreviousBuild()?.result != 'ABORTED'
+                }
             }
             steps {
                 container('terraform') {
-                    dir("${env.TERRAFORM_DIR}") {
-                        echo 'Creating Terraform plan...'
-                        withCredentials([
-                            string(credentialsId: 'aws-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
-                            string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
-                        ]) {
+                    dir('terraform-code') {
+                        script {
+                            echo 'Retrieving Terraform outputs...'
+                            
+                            // Display all outputs
                             sh '''
-                                terraform plan -no-color -out=tfplan
+                                echo "=== Terraform Outputs ==="
+                                terraform output -no-color || echo "No outputs available"
+                            '''
+                            
+                            // Save SSH key if available
+                            def sshKeyExists = sh(
+                                script: 'terraform output -raw private_key_pem 2>/dev/null',
+                                returnStatus: true
+                            ) == 0
+                            
+                            if (sshKeyExists) {
+                                echo 'Saving SSH private key...'
+                                sh '''
+                                    terraform output -raw private_key_pem > ssh-key.pem
+                                    chmod 600 ssh-key.pem
+                                    ls -lh ssh-key.pem
+                                '''
+                                
+                                // Archive the SSH key as a Jenkins artifact
+                                archiveArtifacts artifacts: 'ssh-key.pem', 
+                                               fingerprint: true,
+                                               allowEmptyArchive: true
+                                
+                                echo 'SSH key saved as Jenkins artifact'
+                                echo 'You can download it from the build artifacts'
+                            } else {
+                                echo 'No SSH key output found'
+                            }
+                            
+                            // Display cluster connection info if available
+                            sh '''
                                 echo ""
-                                echo "=================================="
-                                echo "Plan Summary:"
-                                echo "Cluster: ${TF_VAR_cluster_name}"
-                                echo "Region: ${AWS_DEFAULT_REGION}"
-                                echo "=================================="
+                                echo "=== Cluster Information ==="
+                                terraform output -no-color cluster_endpoint 2>/dev/null || echo "Cluster endpoint: Not available"
+                                terraform output -no-color cluster_name 2>/dev/null || echo "Cluster name: Not available"
+                                echo ""
                             '''
                         }
                     }
                 }
             }
         }
-        
-        stage('Approval for Apply') {
-            when {
-                expression { params.ACTION == 'apply' }
-            }
-            steps {
-                script {
-                    input message: 'Deploy infrastructure to AWS?', 
-                          ok: 'Yes, Deploy Now'
-                }
-            }
-        }
-        
-        stage('Terraform Apply') {
-            when {
-                expression { params.ACTION == 'apply' }
-            }
-            steps {
-                container('terraform') {
-                    dir("${env.TERRAFORM_DIR}") {
-                        echo 'Deploying infrastructure...'
-                        withCredentials([
-                            string(credentialsId: 'aws-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
-                            string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
-                        ]) {
-                            sh 'terraform apply -no-color -auto-approve tfplan'
-                        }
-                        echo 'Deployment complete!'
-                    }
-                }
-            }
-        }
-        
-        stage('Approval for Destroy') {
-            when {
-                expression { params.ACTION == 'destroy' }
-            }
-            steps {
-                script {
-                    input message: 'DESTROY all resources?', 
-                          ok: 'Yes, Destroy Everything'
-                }
-            }
-        }
-        
-        stage('Terraform Destroy') {
-            when {
-                expression { params.ACTION == 'destroy' }
-            }
-            steps {
-                container('terraform') {
-                    dir("${env.TERRAFORM_DIR}") {
-                        echo 'Destroying infrastructure...'
-                        withCredentials([
-                            string(credentialsId: 'aws-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
-                            string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
-                        ]) {
-                            sh 'terraform destroy -no-color -auto-approve'
-                        }
-                        echo 'All resources destroyed!'
-                    }
-                }
-            }
-        }
-        
-        stage('Display Outputs and Save Keys') {
-            when {
-                expression { params.ACTION == 'apply' }
-            }
-            steps {
-                container('terraform') {
-                    dir("${env.TERRAFORM_DIR}") {
-                        echo 'Retrieving deployment information...'
-                        sh '''
-                            echo ""
-                            echo "=================================="
-                            echo "CLUSTER ACCESS INFORMATION"
-                            echo "=================================="
-                            terraform output -no-color
-                            echo ""
-                            
-                            # Save outputs
-                            terraform output -no-color > deployment-info.txt
-                            
-                            # Find and display SSH key info
-                            echo ""
-                            echo "SSH Key Files:"
-                            ls -lh *.pem 2>/dev/null || echo "No .pem files found"
-                            
-                            # Get master IP
-                            MASTER_IP=$(terraform output -raw master_public_ip 2>/dev/null || echo "unknown")
-                            SSH_KEY=$(ls *.pem 2>/dev/null | head -n1)
-                            
-                            echo ""
-                            echo "=================================="
-                            echo "QUICK ACCESS COMMAND:"
-                            echo "=================================="
-                            if [ -f "$SSH_KEY" ]; then
-                                echo "ssh -i $SSH_KEY ubuntu@$MASTER_IP"
-                                echo ""
-                                echo "Download the SSH key from Jenkins artifacts:"
-                                echo "Build #${BUILD_NUMBER} -> Artifacts -> $SSH_KEY"
-                            fi
-                            echo ""
-                        '''
-                        
-                        // Archive deployment info
-                        archiveArtifacts artifacts: 'deployment-info.txt', 
-                                        fingerprint: true,
-                                        allowEmptyArchive: true
-                        
-                        // Archive SSH key (IMPORTANT!)
-                        archiveArtifacts artifacts: '*.pem', 
-                                        fingerprint: true,
-                                        allowEmptyArchive: true
-                    }
-                }
-            }
-        }
     }
-    
+
     post {
-        success {
-            script {
-                echo ''
-                echo '=================================='
-                echo 'Pipeline completed successfully!'
-                echo '=================================='
-                if (params.ACTION == 'apply') {
-                    echo ''
-                    echo 'Next Steps:'
-                    echo '1. Go to Build Artifacts (below)'
-                    echo '2. Download the .pem SSH key file'
-                    echo '3. Download deployment-info.txt for IPs'
-                    echo '4. Connect: ssh -i <key>.pem ubuntu@<master-ip>'
-                    echo ''
+        always {
+            container('terraform') {
+                dir('terraform-code') {
+                    echo 'Cleaning up...'
+                    sh 'rm -f tfplan'
                 }
             }
+        }
+        success {
+            echo 'Pipeline completed successfully! ✓'
         }
         failure {
             echo 'Pipeline failed! Check logs above.'
         }
-        always {
-            container('terraform') {
-                dir("${env.TERRAFORM_DIR}") {
-                    sh 'rm -f tfplan 2>/dev/null || true'
-                }
-            }
+        aborted {
+            echo 'Pipeline was aborted.'
         }
     }
 }
